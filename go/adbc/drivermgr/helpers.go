@@ -53,9 +53,8 @@ func cStringFree(_ *byte) {
 	// Go GC handles this
 }
 
-// puregoToAdbcError converts a C AdbcError to a Go adbc.Error.
-// This will be renamed to toAdbcError in Phase 5 when wrapper.go is replaced.
-func puregoToAdbcError(code AdbcStatusCode, e *AdbcError) error {
+// toAdbcError converts a C AdbcError to a Go adbc.Error.
+func toAdbcError(code AdbcStatusCode, e *AdbcError) error {
 	if e == nil || e.Release == 0 {
 		return adbc.Error{
 			Code: adbc.Status(code),
