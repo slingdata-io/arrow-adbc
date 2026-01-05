@@ -22,8 +22,6 @@ import (
 	"os"
 	"runtime"
 	"sync"
-
-	"github.com/ebitengine/purego"
 )
 
 var (
@@ -56,7 +54,7 @@ func loadDriverManagerLibrary() (uintptr, error) {
 		}
 
 		var lib uintptr
-		lib, loadErr = purego.Dlopen(libName, purego.RTLD_NOW|purego.RTLD_GLOBAL)
+		lib, loadErr = loadLibrary(libName)
 		if loadErr != nil {
 			loadErr = fmt.Errorf("failed to load ADBC driver manager library %q: %w. You can specify the exact path with env var ADBC_DRIVER_MANAGER_LIB", libName, loadErr)
 			return
