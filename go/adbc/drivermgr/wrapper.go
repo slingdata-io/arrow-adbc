@@ -357,10 +357,14 @@ func (c *cnxn) NewStatement() (adbc.Statement, error) {
 }
 
 func (c *cnxn) Close() error {
+	if c.conn == nil {
+		return nil
+	}
 	var adbcErr AdbcError
 	if code := adbcConnectionRelease(c.conn, &adbcErr); code != StatusOK {
 		return toAdbcError(code, &adbcErr)
 	}
+	c.conn = nil
 	return nil
 }
 
@@ -384,10 +388,14 @@ type stmt struct {
 }
 
 func (s *stmt) Close() error {
+	if s.st == nil {
+		return nil
+	}
 	var adbcErr AdbcError
 	if code := adbcStatementRelease(s.st, &adbcErr); code != StatusOK {
 		return toAdbcError(code, &adbcErr)
 	}
+	s.st = nil
 	return nil
 }
 
