@@ -17,38 +17,6 @@
 
 package drivermgr
 
-// #cgo !windows LDFLAGS: -ldl
-// #cgo windows CFLAGS: -DADBC_EXPORTING
-// #cgo windows CPPFLAGS: -DADBC_EXPORTING
-// #cgo windows LDFLAGS: -lshell32 -ladvapi32 -luuid
-// #cgo CXXFLAGS: -std=c++17 -I${SRCDIR}/vendored/
-// #if !defined(ADBC_EXPORTING)
-// #define ADBC_EXPORTING
-// #endif
-// #include "arrow-adbc/adbc.h"
-// #include "arrow-adbc/adbc_driver_manager.h"
-// #include <stdlib.h>
-// #include <string.h>
-//
-// void releaseErr(struct AdbcError* err) {
-//     if (err->release != NULL) {
-//         err->release(err);
-//         err->release = NULL;
-//     }
-// }
-// struct ArrowArray* allocArr() {
-//     struct ArrowArray* array = (struct ArrowArray*)malloc(sizeof(struct ArrowArray));
-//     memset(array, 0, sizeof(struct ArrowArray));
-//     return array;
-// }
-//
-// struct ArrowArrayStream* allocArrStream() {
-//     struct ArrowArrayStream* stream = (struct ArrowArrayStream*)malloc(sizeof(struct ArrowArrayStream));
-//     memset(stream, 0, sizeof(struct ArrowArrayStream));
-//     return stream;
-// }
-//
-import "C"
 import (
 	"context"
 	"strconv"
@@ -73,22 +41,17 @@ const (
 	LoadFlagsOptionKey = "load_flags"
 )
 
+// option holds a key-value pair with null-terminated byte slices.
 type option struct {
-	key, val *C.char
+	key, val []byte
 }
 
 func convOptions(incoming map[string]string, existing map[string]option) {
 	for k, v := range incoming {
-		o, ok := existing[k]
-		if !ok {
-			o.key = C.CString(k)
-			o.val = C.CString(v)
-			existing[k] = o
-			continue
+		o := option{
+			key: append([]byte(k), 0),
+			val: append([]byte(v), 0),
 		}
-
-		C.free(unsafe.Pointer(o.val))
-		o.val = C.CString(v)
 		existing[k] = o
 	}
 }
@@ -100,6 +63,11 @@ func (d Driver) NewDatabase(opts map[string]string) (adbc.Database, error) {
 }
 
 func (d Driver) NewDatabaseWithContext(_ context.Context, opts map[string]string) (adbc.Database, error) {
+	// Ensure library is loaded
+	if _, err := loadDriverManagerLibrary(); err != nil {
+		return nil, err
+	}
+
 	dbOptions := make(map[string]option)
 	convOptions(opts, dbOptions)
 
@@ -107,92 +75,61 @@ func (d Driver) NewDatabaseWithContext(_ context.Context, opts map[string]string
 		options: make(map[string]option),
 	}
 
-	defer func() {
-		if db.db == nil { // cleanup options if we failed to create the database
-			for _, o := range dbOptions {
-				C.free(unsafe.Pointer(o.key))
-				C.free(unsafe.Pointer(o.val))
-			}
-		}
-	}()
+	var adbcErr AdbcError
+	var adbcDb AdbcDatabase
 
-	var err C.struct_AdbcError
-	db.db = (*C.struct_AdbcDatabase)(unsafe.Pointer(C.calloc(C.sizeof_struct_AdbcDatabase, C.size_t(1))))
-	if code := adbc.Status(C.AdbcDatabaseNew(db.db, &err)); code != adbc.StatusOK {
-		return nil, toAdbcError(code, &err)
+	if code := adbcDatabaseNew(&adbcDb, &adbcErr); code != StatusOK {
+		return nil, toAdbcError(code, &adbcErr)
 	}
 
-	if code := adbc.Status(C.AdbcDriverManagerDatabaseSetLoadFlags(db.db, C.AdbcLoadFlags(LoadFlagsDefault), &err)); code != adbc.StatusOK {
-		errOut := toAdbcError(code, &err)
-		C.AdbcDatabaseRelease(db.db, &err)
-		db.db = nil
+	if code := adbcDriverManagerDatabaseSetLoadFlags(&adbcDb, AdbcLoadFlags(LoadFlagsDefault), &adbcErr); code != StatusOK {
+		errOut := toAdbcError(code, &adbcErr)
+		adbcDatabaseRelease(&adbcDb, &adbcErr)
 		return nil, errOut
 	}
 
 	for k, o := range dbOptions {
 		switch k {
 		case LoadFlagsOptionKey:
-			f, errOut := strconv.Atoi(C.GoString(o.val))
+			f, errOut := strconv.Atoi(string(o.val[:len(o.val)-1])) // exclude null terminator
 			if errOut != nil {
-				C.AdbcDatabaseRelease(db.db, &err)
-				db.db = nil
+				adbcDatabaseRelease(&adbcDb, &adbcErr)
 				return nil, adbc.Error{
 					Code: adbc.StatusInvalidArgument,
-					Msg:  "invalid load flags value: " + C.GoString(o.val),
+					Msg:  "invalid load flags value: " + string(o.val[:len(o.val)-1]),
 				}
 			}
 
-			if code := adbc.Status(C.AdbcDriverManagerDatabaseSetLoadFlags(db.db, C.AdbcLoadFlags(f), &err)); code != adbc.StatusOK {
-				errOut := toAdbcError(code, &err)
-				C.AdbcDatabaseRelease(db.db, &err)
-				db.db = nil
+			if code := adbcDriverManagerDatabaseSetLoadFlags(&adbcDb, AdbcLoadFlags(f), &adbcErr); code != StatusOK {
+				errOut := toAdbcError(code, &adbcErr)
+				adbcDatabaseRelease(&adbcDb, &adbcErr)
 				return nil, errOut
 			}
 		default:
-			if code := adbc.Status(C.AdbcDatabaseSetOption(db.db, o.key, o.val, &err)); code != adbc.StatusOK {
-				errOut := toAdbcError(code, &err)
-				C.AdbcDatabaseRelease(db.db, &err)
-				db.db = nil
+			if code := adbcDatabaseSetOption(&adbcDb, &o.key[0], &o.val[0], &adbcErr); code != StatusOK {
+				errOut := toAdbcError(code, &adbcErr)
+				adbcDatabaseRelease(&adbcDb, &adbcErr)
 				return nil, errOut
 			}
 		}
 	}
 
-	if code := adbc.Status(C.AdbcDatabaseInit(db.db, &err)); code != adbc.StatusOK {
-		errOut := toAdbcError(code, &err)
-		C.AdbcDatabaseRelease(db.db, &err)
-		db.db = nil
+	if code := adbcDatabaseInit(&adbcDb, &adbcErr); code != StatusOK {
+		errOut := toAdbcError(code, &adbcErr)
+		adbcDatabaseRelease(&adbcDb, &adbcErr)
 		return nil, errOut
 	}
 
+	db.db = &adbcDb
 	return db, nil
 }
 
 type Database struct {
 	options map[string]option
-	db      *C.struct_AdbcDatabase
+	db      *AdbcDatabase
 
 	mu     sync.Mutex // protects following fields
 	closed bool
-}
-
-func toAdbcError(code adbc.Status, e *C.struct_AdbcError) error {
-	if e == nil || e.release == nil {
-		return adbc.Error{
-			Code: code,
-			Msg:  "[drivermgr] nil error",
-		}
-	}
-	err := adbc.Error{
-		Code:       code,
-		VendorCode: int32(e.vendor_code),
-		Msg:        C.GoString(e.message),
-	}
-	for i := 0; i < 5; i++ {
-		err.SqlState[i] = byte(e.sqlstate[i])
-	}
-	C.releaseErr(e)
-	return err
 }
 
 func (d *Database) SetOptions(options map[string]string) error {
@@ -201,40 +138,34 @@ func (d *Database) SetOptions(options map[string]string) error {
 	}
 
 	for k, v := range options {
-		o, ok := d.options[k]
-		if !ok {
-			o.key = C.CString(k)
-			o.val = C.CString(v)
-			d.options[k] = o
-			continue
+		o := option{
+			key: append([]byte(k), 0),
+			val: append([]byte(v), 0),
 		}
-
-		C.free(unsafe.Pointer(o.val))
-		o.val = C.CString(v)
 		d.options[k] = o
 	}
 	return nil
 }
 
 func (d *Database) Open(context.Context) (adbc.Connection, error) {
-	var err C.struct_AdbcError
+	var adbcErr AdbcError
+	var c AdbcConnection
 
-	var c C.struct_AdbcConnection
-	if code := adbc.Status(C.AdbcConnectionNew(&c, &err)); code != adbc.StatusOK {
-		return nil, toAdbcError(code, &err)
+	if code := adbcConnectionNew(&c, &adbcErr); code != StatusOK {
+		return nil, toAdbcError(code, &adbcErr)
 	}
 
 	for _, o := range d.options {
-		if code := adbc.Status(C.AdbcConnectionSetOption(&c, o.key, o.val, &err)); code != adbc.StatusOK {
-			errOut := toAdbcError(code, &err)
-			C.AdbcConnectionRelease(&c, &err)
+		if code := adbcConnectionSetOption(&c, &o.key[0], &o.val[0], &adbcErr); code != StatusOK {
+			errOut := toAdbcError(code, &adbcErr)
+			adbcConnectionRelease(&c, &adbcErr)
 			return nil, errOut
 		}
 	}
 
-	if code := adbc.Status(C.AdbcConnectionInit(&c, d.db, &err)); code != adbc.StatusOK {
-		errOut := toAdbcError(code, &err)
-		C.AdbcConnectionRelease(&c, &err)
+	if code := adbcConnectionInit(&c, d.db, &adbcErr); code != StatusOK {
+		errOut := toAdbcError(code, &adbcErr)
+		adbcConnectionRelease(&c, &adbcErr)
 		return nil, errOut
 	}
 
@@ -251,23 +182,18 @@ func (d *Database) Close() error {
 
 	d.closed = true
 
-	for _, o := range d.options {
-		C.free(unsafe.Pointer(o.key))
-		C.free(unsafe.Pointer(o.val))
-	}
-
 	if d.db != nil {
-		var err C.struct_AdbcError
-		code := adbc.Status(C.AdbcDatabaseRelease(d.db, &err))
-		if code != adbc.StatusOK {
-			return toAdbcError(code, &err)
+		var adbcErr AdbcError
+		code := adbcDatabaseRelease(d.db, &adbcErr)
+		if code != StatusOK {
+			return toAdbcError(code, &adbcErr)
 		}
 	}
 
 	return nil
 }
 
-func getRdr(out *C.struct_ArrowArrayStream) (array.RecordReader, error) {
+func getRdr(out *ArrowArrayStream) (array.RecordReader, error) {
 	rdr, err := cdata.ImportCRecordReader((*cdata.CArrowArrayStream)(unsafe.Pointer(out)), nil)
 	if err != nil {
 		return nil, err
@@ -275,9 +201,9 @@ func getRdr(out *C.struct_ArrowArrayStream) (array.RecordReader, error) {
 	return rdr.(array.RecordReader), nil
 }
 
-func getSchema(out *C.struct_ArrowSchema) (*arrow.Schema, error) {
+func getSchema(out *ArrowSchema) (*arrow.Schema, error) {
 	// Maybe: ImportCArrowSchema should perform this check?
-	if out.format == nil {
+	if out.Format == nil {
 		return nil, nil
 	}
 
@@ -285,21 +211,21 @@ func getSchema(out *C.struct_ArrowSchema) (*arrow.Schema, error) {
 }
 
 type cnxn struct {
-	conn *C.struct_AdbcConnection
+	conn *AdbcConnection
 }
 
 func (c *cnxn) GetInfo(_ context.Context, infoCodes []adbc.InfoCode) (array.RecordReader, error) {
 	var (
-		out   C.struct_ArrowArrayStream
-		err   C.struct_AdbcError
-		codes *C.uint32_t
+		out   ArrowArrayStream
+		adbcErr AdbcError
+		codes *uint32
 	)
 	if len(infoCodes) > 0 {
-		codes = (*C.uint32_t)(unsafe.Pointer(&infoCodes[0]))
+		codes = (*uint32)(unsafe.Pointer(&infoCodes[0]))
 	}
 
-	if code := adbc.Status(C.AdbcConnectionGetInfo(c.conn, codes, (C.size_t)(len(infoCodes)), &out, &err)); code != adbc.StatusOK {
-		return nil, toAdbcError(code, &err)
+	if code := adbcConnectionGetInfo(c.conn, codes, uintptr(len(infoCodes)), &out, &adbcErr); code != StatusOK {
+		return nil, toAdbcError(code, &adbcErr)
 	}
 
 	return getRdr(&out)
@@ -307,75 +233,82 @@ func (c *cnxn) GetInfo(_ context.Context, infoCodes []adbc.InfoCode) (array.Reco
 
 func (c *cnxn) GetObjects(_ context.Context, depth adbc.ObjectDepth, catalog, dbSchema, tableName, columnName *string, tableType []string) (array.RecordReader, error) {
 	var (
-		out         C.struct_ArrowArrayStream
-		err         C.struct_AdbcError
-		catalog_    *C.char
-		dbSchema_   *C.char
-		tableName_  *C.char
-		columnName_ *C.char
-		tableType_  **C.char
+		out         ArrowArrayStream
+		adbcErr     AdbcError
+		catalogBuf  []byte
+		dbSchemaBuf []byte
+		tableNameBuf []byte
+		columnNameBuf []byte
+		tableTypePtrs []*byte
 	)
 
+	var catalogPtr, dbSchemaPtr, tableNamePtr, columnNamePtr *byte
+	var tableTypePtr **byte
+
 	if catalog != nil {
-		catalog_ = C.CString(*catalog)
-		defer C.free(unsafe.Pointer(catalog_))
+		catalogBuf = append([]byte(*catalog), 0)
+		catalogPtr = &catalogBuf[0]
 	}
 
 	if dbSchema != nil {
-		dbSchema_ = C.CString(*dbSchema)
-		defer C.free(unsafe.Pointer(dbSchema_))
+		dbSchemaBuf = append([]byte(*dbSchema), 0)
+		dbSchemaPtr = &dbSchemaBuf[0]
 	}
 
 	if tableName != nil {
-		tableName_ = C.CString(*tableName)
-		defer C.free(unsafe.Pointer(tableName_))
+		tableNameBuf = append([]byte(*tableName), 0)
+		tableNamePtr = &tableNameBuf[0]
 	}
 
 	if columnName != nil {
-		columnName_ = C.CString(*columnName)
-		defer C.free(unsafe.Pointer(columnName_))
+		columnNameBuf = append([]byte(*columnName), 0)
+		columnNamePtr = &columnNameBuf[0]
 	}
 
+	// Build null-terminated array of null-terminated strings
+	tableTypeBuffers := make([][]byte, len(tableType)+1)
 	if len(tableType) > 0 {
-		cArr := []*C.char{}
-		for _, tt := range tableType {
-			cs := C.CString(tt)
-			cArr = append(cArr, cs)
-			defer C.free(unsafe.Pointer(cs))
+		tableTypePtrs = make([]*byte, len(tableType)+1)
+		for i, tt := range tableType {
+			tableTypeBuffers[i] = append([]byte(tt), 0)
+			tableTypePtrs[i] = &tableTypeBuffers[i][0]
 		}
-		tableType_ = &cArr[0]
+		tableTypePtrs[len(tableType)] = nil // null terminator
+		tableTypePtr = &tableTypePtrs[0]
 	}
 
-	if code := adbc.Status(C.AdbcConnectionGetObjects(c.conn, C.int(depth), catalog_, dbSchema_, tableName_, tableType_, columnName_, &out, &err)); code != adbc.StatusOK {
-		return nil, toAdbcError(code, &err)
+	if code := adbcConnectionGetObjects(c.conn, int32(depth), catalogPtr, dbSchemaPtr, tableNamePtr, tableTypePtr, columnNamePtr, &out, &adbcErr); code != StatusOK {
+		return nil, toAdbcError(code, &adbcErr)
 	}
 	return getRdr(&out)
 }
 
 func (c *cnxn) GetTableSchema(_ context.Context, catalog, dbSchema *string, tableName string) (*arrow.Schema, error) {
 	var (
-		schema     C.struct_ArrowSchema
-		err        C.struct_AdbcError
-		catalog_   *C.char
-		dbSchema_  *C.char
-		tableName_ *C.char
+		schema       ArrowSchema
+		adbcErr      AdbcError
+		catalogBuf   []byte
+		dbSchemaBuf  []byte
+		tableNameBuf []byte
 	)
 
+	var catalogPtr, dbSchemaPtr *byte
+
 	if catalog != nil {
-		catalog_ = C.CString(*catalog)
-		defer C.free(unsafe.Pointer(catalog_))
+		catalogBuf = append([]byte(*catalog), 0)
+		catalogPtr = &catalogBuf[0]
 	}
 
 	if dbSchema != nil {
-		dbSchema_ = C.CString(*dbSchema)
-		defer C.free(unsafe.Pointer(dbSchema_))
+		dbSchemaBuf = append([]byte(*dbSchema), 0)
+		dbSchemaPtr = &dbSchemaBuf[0]
 	}
 
-	tableName_ = C.CString(tableName)
-	defer C.free(unsafe.Pointer(tableName_))
+	tableNameBuf = append([]byte(tableName), 0)
+	tableNamePtr := &tableNameBuf[0]
 
-	if code := adbc.Status(C.AdbcConnectionGetTableSchema(c.conn, catalog_, dbSchema_, tableName_, &schema, &err)); code != adbc.StatusOK {
-		return nil, toAdbcError(code, &err)
+	if code := adbcConnectionGetTableSchema(c.conn, catalogPtr, dbSchemaPtr, tableNamePtr, &schema, &adbcErr); code != StatusOK {
+		return nil, toAdbcError(code, &adbcErr)
 	}
 
 	return getSchema(&schema)
@@ -383,55 +316,55 @@ func (c *cnxn) GetTableSchema(_ context.Context, catalog, dbSchema *string, tabl
 
 func (c *cnxn) GetTableTypes(context.Context) (array.RecordReader, error) {
 	var (
-		out C.struct_ArrowArrayStream
-		err C.struct_AdbcError
+		out     ArrowArrayStream
+		adbcErr AdbcError
 	)
 
-	if code := adbc.Status(C.AdbcConnectionGetTableTypes(c.conn, &out, &err)); code != adbc.StatusOK {
-		return nil, toAdbcError(code, &err)
+	if code := adbcConnectionGetTableTypes(c.conn, &out, &adbcErr); code != StatusOK {
+		return nil, toAdbcError(code, &adbcErr)
 	}
 	return getRdr(&out)
 }
 
 func (c *cnxn) Commit(context.Context) error {
-	var (
-		err C.struct_AdbcError
-	)
+	var adbcErr AdbcError
 
-	if code := adbc.Status(C.AdbcConnectionCommit(c.conn, &err)); code != adbc.StatusOK {
-		return toAdbcError(code, &err)
+	if code := adbcConnectionCommit(c.conn, &adbcErr); code != StatusOK {
+		return toAdbcError(code, &adbcErr)
 	}
 
 	return nil
 }
 
 func (c *cnxn) Rollback(context.Context) error {
-	var (
-		err C.struct_AdbcError
-	)
+	var adbcErr AdbcError
 
-	if code := adbc.Status(C.AdbcConnectionRollback(c.conn, &err)); code != adbc.StatusOK {
-		return toAdbcError(code, &err)
+	if code := adbcConnectionRollback(c.conn, &adbcErr); code != StatusOK {
+		return toAdbcError(code, &adbcErr)
 	}
 
 	return nil
 }
 
 func (c *cnxn) NewStatement() (adbc.Statement, error) {
-	var st C.struct_AdbcStatement
-	var err C.struct_AdbcError
-	if code := adbc.Status(C.AdbcStatementNew(c.conn, &st, &err)); code != adbc.StatusOK {
-		return nil, toAdbcError(code, &err)
+	var st AdbcStatement
+	var adbcErr AdbcError
+	if code := adbcStatementNew(c.conn, &st, &adbcErr); code != StatusOK {
+		return nil, toAdbcError(code, &adbcErr)
 	}
 
 	return &stmt{st: &st}, nil
 }
 
 func (c *cnxn) Close() error {
-	var err C.struct_AdbcError
-	if code := adbc.Status(C.AdbcConnectionRelease(c.conn, &err)); code != adbc.StatusOK {
-		return toAdbcError(code, &err)
+	if c.conn == nil {
+		return nil
 	}
+	var adbcErr AdbcError
+	if code := adbcConnectionRelease(c.conn, &adbcErr); code != StatusOK {
+		return toAdbcError(code, &adbcErr)
+	}
+	c.conn = nil
 	return nil
 }
 
@@ -440,85 +373,86 @@ func (c *cnxn) ReadPartition(_ context.Context, serializedPartition []byte) (arr
 }
 
 func (c *cnxn) SetOption(key, value string) error {
-	ckey, cvalue := C.CString(key), C.CString(value)
-	defer C.free(unsafe.Pointer(ckey))
-	defer C.free(unsafe.Pointer(cvalue))
+	keyBuf := append([]byte(key), 0)
+	valueBuf := append([]byte(value), 0)
 
-	var err C.struct_AdbcError
-	if code := adbc.Status(C.AdbcConnectionSetOption(c.conn, ckey, cvalue, &err)); code != adbc.StatusOK {
-		return toAdbcError(code, &err)
+	var adbcErr AdbcError
+	if code := adbcConnectionSetOption(c.conn, &keyBuf[0], &valueBuf[0], &adbcErr); code != StatusOK {
+		return toAdbcError(code, &adbcErr)
 	}
 	return nil
 }
 
 type stmt struct {
-	st *C.struct_AdbcStatement
+	st *AdbcStatement
 }
 
 func (s *stmt) Close() error {
-	var err C.struct_AdbcError
-	if code := adbc.Status(C.AdbcStatementRelease(s.st, &err)); code != adbc.StatusOK {
-		return toAdbcError(code, &err)
+	if s.st == nil {
+		return nil
 	}
+	var adbcErr AdbcError
+	if code := adbcStatementRelease(s.st, &adbcErr); code != StatusOK {
+		return toAdbcError(code, &adbcErr)
+	}
+	s.st = nil
 	return nil
 }
 
 func (s *stmt) SetOption(key, val string) error {
-	ckey, cvalue := C.CString(key), C.CString(val)
-	defer C.free(unsafe.Pointer(ckey))
-	defer C.free(unsafe.Pointer(cvalue))
+	keyBuf := append([]byte(key), 0)
+	valBuf := append([]byte(val), 0)
 
-	var err C.struct_AdbcError
-	if code := adbc.Status(C.AdbcStatementSetOption(s.st, ckey, cvalue, &err)); code != adbc.StatusOK {
-		return toAdbcError(code, &err)
+	var adbcErr AdbcError
+	if code := adbcStatementSetOption(s.st, &keyBuf[0], &valBuf[0], &adbcErr); code != StatusOK {
+		return toAdbcError(code, &adbcErr)
 	}
 	return nil
 }
 
 func (s *stmt) SetSqlQuery(query string) error {
-	var err C.struct_AdbcError
-	cquery := C.CString(query)
-	defer C.free(unsafe.Pointer(cquery))
+	var adbcErr AdbcError
+	queryBuf := append([]byte(query), 0)
 
-	if code := adbc.Status(C.AdbcStatementSetSqlQuery(s.st, cquery, &err)); code != adbc.StatusOK {
-		return toAdbcError(code, &err)
+	if code := adbcStatementSetSqlQuery(s.st, &queryBuf[0], &adbcErr); code != StatusOK {
+		return toAdbcError(code, &adbcErr)
 	}
 	return nil
 }
 
 func (s *stmt) ExecuteQuery(context.Context) (array.RecordReader, int64, error) {
 	var (
-		out      C.struct_ArrowArrayStream
-		affected C.int64_t
-		err      C.struct_AdbcError
+		out      ArrowArrayStream
+		affected int64
+		adbcErr  AdbcError
 	)
-	code := adbc.Status(C.AdbcStatementExecuteQuery(s.st, &out, &affected, &err))
-	if code != adbc.StatusOK {
-		return nil, 0, toAdbcError(code, &err)
+	code := adbcStatementExecuteQuery(s.st, &out, &affected, &adbcErr)
+	if code != StatusOK {
+		return nil, 0, toAdbcError(code, &adbcErr)
 	}
 
 	rdr, goerr := getRdr(&out)
 	if goerr != nil {
-		return nil, int64(affected), goerr
+		return nil, affected, goerr
 	}
-	return rdr, int64(affected), nil
+	return rdr, affected, nil
 }
 
 func (s *stmt) ExecuteUpdate(context.Context) (int64, error) {
 	var (
-		nrows C.int64_t
-		err   C.struct_AdbcError
+		nrows   int64
+		adbcErr AdbcError
 	)
-	if code := adbc.Status(C.AdbcStatementExecuteQuery(s.st, nil, &nrows, &err)); code != adbc.StatusOK {
-		return -1, toAdbcError(code, &err)
+	if code := adbcStatementExecuteQuery(s.st, nil, &nrows, &adbcErr); code != StatusOK {
+		return -1, toAdbcError(code, &adbcErr)
 	}
-	return int64(nrows), nil
+	return nrows, nil
 }
 
 func (s *stmt) Prepare(context.Context) error {
-	var err C.struct_AdbcError
-	if code := adbc.Status(C.AdbcStatementPrepare(s.st, &err)); code != adbc.StatusOK {
-		return toAdbcError(code, &err)
+	var adbcErr AdbcError
+	if code := adbcStatementPrepare(s.st, &adbcErr); code != StatusOK {
+		return toAdbcError(code, &adbcErr)
 	}
 	return nil
 }
@@ -528,50 +462,47 @@ func (s *stmt) SetSubstraitPlan(plan []byte) error {
 }
 
 func (s *stmt) Bind(_ context.Context, values arrow.RecordBatch) error {
-	var (
-		arr    = C.allocArr()
-		schema C.struct_ArrowSchema
+	arr := allocArrowArray()
+	schema := allocArrowSchema()
 
-		cdArr    = (*cdata.CArrowArray)(unsafe.Pointer(arr))
-		cdSchema = (*cdata.CArrowSchema)(unsafe.Pointer(&schema))
-		err      C.struct_AdbcError
-	)
+	cdArr := (*cdata.CArrowArray)(unsafe.Pointer(arr))
+	cdSchema := (*cdata.CArrowSchema)(unsafe.Pointer(schema))
+
 	cdata.ExportArrowRecordBatch(values, cdArr, cdSchema)
 	defer func() {
 		cdata.ReleaseCArrowArray(cdArr)
 		cdata.ReleaseCArrowSchema(cdSchema)
-
-		C.free(unsafe.Pointer(arr))
 	}()
 
-	code := adbc.Status(C.AdbcStatementBind(s.st, arr, &schema, &err))
-	if code != adbc.StatusOK {
-		return toAdbcError(code, &err)
+	var adbcErr AdbcError
+	code := adbcStatementBind(s.st, arr, schema, &adbcErr)
+	if code != StatusOK {
+		return toAdbcError(code, &adbcErr)
 	}
 	return nil
 }
 
 func (s *stmt) BindStream(_ context.Context, stream array.RecordReader) error {
-	var (
-		arrStream   = C.allocArrStream()
-		cdArrStream = (*cdata.CArrowArrayStream)(unsafe.Pointer(arrStream))
-		err         C.struct_AdbcError
-	)
+	arrStream := allocArrowArrayStream()
+	cdArrStream := (*cdata.CArrowArrayStream)(unsafe.Pointer(arrStream))
+
 	cdata.ExportRecordReader(stream, cdArrStream)
-	if code := adbc.Status(C.AdbcStatementBindStream(s.st, arrStream, &err)); code != adbc.StatusOK {
-		return toAdbcError(code, &err)
+
+	var adbcErr AdbcError
+	if code := adbcStatementBindStream(s.st, arrStream, &adbcErr); code != StatusOK {
+		return toAdbcError(code, &adbcErr)
 	}
 	return nil
 }
 
 func (s *stmt) GetParameterSchema() (*arrow.Schema, error) {
 	var (
-		schema C.struct_ArrowSchema
-		err    C.struct_AdbcError
+		schema  ArrowSchema
+		adbcErr AdbcError
 	)
 
-	if code := adbc.Status(C.AdbcStatementGetParameterSchema(s.st, &schema, &err)); code != adbc.StatusOK {
-		return nil, toAdbcError(code, &err)
+	if code := adbcStatementGetParameterSchema(s.st, &schema, &adbcErr); code != StatusOK {
+		return nil, toAdbcError(code, &adbcErr)
 	}
 
 	return getSchema(&schema)
