@@ -26,6 +26,7 @@ require (
 	github.com/apache/arrow-go/v18 v18.5.0
 	github.com/bluele/gcache v0.0.2
 	github.com/databricks/databricks-sql-go v1.9.0
+	github.com/ebitengine/purego v0.10.0
 	github.com/golang/protobuf v1.5.4
 	github.com/google/uuid v1.6.0
 	github.com/snowflakedb/gosnowflake v1.17.1
@@ -90,7 +91,6 @@ require (
 	github.com/dnephin/pflag v1.0.7 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/dvsekhvalnov/jose2go v1.7.0 // indirect
-	github.com/ebitengine/purego v0.9.1 // indirect
 	github.com/fatih/color v1.16.0 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/fsnotify/fsnotify v1.5.4 // indirect
