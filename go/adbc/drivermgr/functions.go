@@ -101,9 +101,12 @@ var (
 )
 
 // Error functions (ADBC 1.1.0)
+//
+// AdbcErrorGetDetail is intentionally not bound: it returns AdbcErrorDetail by
+// value, and purego rejects struct returns outside darwin/linux, which panics
+// during registration on Windows. Bind it via an out-param shim if ever needed.
 var (
 	adbcErrorGetDetailCount  func(*AdbcError) int32
-	adbcErrorGetDetail       func(*AdbcError, int32) AdbcErrorDetail
 	adbcErrorFromArrayStream func(*ArrowArrayStream, *AdbcStatusCode) *AdbcError
 )
 
@@ -179,7 +182,6 @@ func registerFunctions(lib uintptr) error {
 
 	// Error functions (ADBC 1.1.0)
 	purego.RegisterLibFunc(&adbcErrorGetDetailCount, lib, "AdbcErrorGetDetailCount")
-	purego.RegisterLibFunc(&adbcErrorGetDetail, lib, "AdbcErrorGetDetail")
 	purego.RegisterLibFunc(&adbcErrorFromArrayStream, lib, "AdbcErrorFromArrayStream")
 
 	return nil

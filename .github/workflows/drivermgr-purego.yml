@@ -1,0 +1,116 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Verifies the purego driver manager bindings load on every supported OS.
+#
+# registerFunctions binds all ADBC symbols in a single sync.Once, so one binding
+# purego rejects on a platform panics the process before any driver is used.
+# purego only supports struct returns on darwin/linux, which made ADBC unusable
+# on Windows. That class of bug is invisible on macOS and Linux, so Windows has
+# to actually run.
+name: Driver Manager (purego)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - purego
+    paths:
+      - "go/adbc/drivermgr/**"
+      - ".github/workflows/drivermgr-purego.yml"
+  pull_request:
+    paths:
+      - "go/adbc/drivermgr/**"
+      - ".github/workflows/drivermgr-purego.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  load-drivermgr:
+    name: Load driver manager (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+
+    defaults:
+      run:
+        working-directory: go/adbc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go/adbc/go.mod
+          cache: false
+
+      # conda-forge is the only channel shipping the driver manager as a
+      # loadable shared library. The PyPI adbc-driver-manager wheel statically
+      # links it into Python extension modules, so nothing there can be dlopen'd.
+      - name: Set up conda
+        uses: conda-incubator/setup-miniconda@835234971496cad1653abb28a638a281cf32541f # v3.2.0
+        with:
+          miniforge-version: latest
+          use-mamba: true
+
+      - name: Install ADBC driver manager
+        shell: bash -el {0}
+        run: mamba install -y -c conda-forge libadbc-driver-manager
+
+      # The library lands in the conda prefix rather than a system lib dir, so
+      # point the loader straight at it instead of relying on a search path.
+      # Windows uses Library\bin\; unix uses lib/.
+      - name: Locate driver manager library
+        shell: bash -el {0}
+        run: |
+          set -euo pipefail
+          lib=""
+          for candidate in \
+            "$CONDA_PREFIX/Library/bin/adbc_driver_manager.dll" \
+            "$CONDA_PREFIX/lib/libadbc_driver_manager.dylib" \
+            "$CONDA_PREFIX/lib/libadbc_driver_manager.so"; do
+            if [ -f "$candidate" ]; then
+              lib="$candidate"
+              break
+            fi
+          done
+          if [ -z "$lib" ]; then
+            echo "could not locate the ADBC driver manager library under $CONDA_PREFIX" >&2
+            exit 1
+          fi
+          echo "found driver manager: $lib"
+          echo "ADBC_DRIVER_MANAGER_LIB=$lib" >> "$GITHUB_ENV"
+
+      # Fails on a registration panic. cgo is required to build the package at
+      # all (wrapper.go imports arrow/cdata); the ADBC calls themselves still go
+      # through purego. Runners ship a C toolchain, mingw-w64 on Windows.
+      - name: Test driver manager loading
+        shell: bash -el {0}
+        env:
+          CGO_ENABLED: "1"
+        run: go test -v -run TestLoadDriverManagerLibrary ./drivermgr/
