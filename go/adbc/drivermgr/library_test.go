@@ -32,6 +32,8 @@ import (
 // darwin/linux, so registration panicked with
 // "purego: struct arguments are only supported on darwin and linux".
 //
+// Reported downstream as slingdata-io/sling-cli#783.
+//
 // Requires the driver manager library to be present; set ADBC_DRIVER_MANAGER_LIB
 // to point at it explicitly.
 func TestLoadDriverManagerLibrary(t *testing.T) {
